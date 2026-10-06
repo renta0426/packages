@@ -670,41 +670,106 @@ class RenderTableViewport extends RenderTwoDimensionalViewport {
     }
   }
 
+  // The scrolling region is shared by painting and hit testing so that cells
+  // hidden behind pinned spans cannot receive pointer events.
+  Rect get _unpinnedCellsRect {
+    final bool reversedH = axisDirectionIsReversed(horizontalAxisDirection);
+    final bool reversedV = axisDirectionIsReversed(verticalAxisDirection);
+    return Rect.fromLTWH(
+      (reversedH ? _trailingPinnedColumnsExtent : _leadingPinnedColumnsExtent) +
+          (reversedH ? -_hAlignmentOffset : _hAlignmentOffset),
+      (reversedV ? _trailingPinnedRowsExtent : _leadingPinnedRowsExtent) +
+          (reversedV ? -_vAlignmentOffset : _vAlignmentOffset),
+      viewportDimension.width - _pinnedColumnsExtent,
+      viewportDimension.height - _pinnedRowsExtent,
+    );
+  }
+
+  // Match the order in paint: regular cells, pinned columns, pinned rows,
+  // then their intersections, with trailing spans painted after leading ones.
+  int _hitTestPriority(TableVicinity vicinity) {
+    final bool pinnedRow = _rowMetrics[vicinity.row]!.isPinned;
+    final bool pinnedColumn = _columnMetrics[vicinity.column]!.isPinned;
+    final bool trailingRow =
+        _firstTrailingPinnedRow != null && vicinity.row >= _firstTrailingPinnedRow!;
+    final bool trailingColumn =
+        _firstTrailingPinnedColumn != null && vicinity.column >= _firstTrailingPinnedColumn!;
+    if (pinnedRow && pinnedColumn) {
+      return (trailingRow ? 7 : 5) + (trailingColumn ? 1 : 0);
+    }
+    if (pinnedRow) {
+      return trailingRow ? 4 : 3;
+    }
+    if (pinnedColumn) {
+      return trailingColumn ? 2 : 1;
+    }
+    return 0;
+  }
+
   @override
   bool hitTestChildren(BoxHitTestResult result, {required Offset position}) {
+    final Rect unpinnedCellsRect = _unpinnedCellsRect;
+    final bool hasPinnedCells =
+        delegate.pinnedRowCount > 0 ||
+        delegate.pinnedColumnCount > 0 ||
+        delegate.trailingPinnedRowCount > 0 ||
+        delegate.trailingPinnedColumnCount > 0;
+    RenderBox? hitCell;
+    var hitPriority = -1;
     RenderBox? cell = firstChild;
     while (cell != null) {
       final TableViewParentData cellParentData = parentDataOf(cell);
-      if (!cellParentData.isVisible) {
-        // This cell is not visible, so it cannot be hit.
-        cell = childAfter(cell);
-        continue;
-      }
-      final Rect cellRect = cellParentData.paintOffset! & cell.size;
-      if (cellRect.contains(position)) {
-        result.addWithPaintOffset(
-          offset: cellParentData.paintOffset,
-          position: position,
-          hitTest: (BoxHitTestResult result, Offset transformed) {
-            assert(transformed == position - cellParentData.paintOffset!);
-            return cell!.hitTest(result, position: transformed);
-          },
-        );
-        switch (mainAxis) {
-          case Axis.vertical:
-            // Row major order, rows go first.
-            result.add(HitTestEntry(_rowMetrics[cellParentData.tableVicinity.row]!));
-            result.add(HitTestEntry(_columnMetrics[cellParentData.tableVicinity.column]!));
-          case Axis.horizontal:
-            // Column major order, columns go first.
-            result.add(HitTestEntry(_columnMetrics[cellParentData.tableVicinity.column]!));
-            result.add(HitTestEntry(_rowMetrics[cellParentData.tableVicinity.row]!));
+      if (cellParentData.isVisible) {
+        final Rect cellRect = cellParentData.paintOffset! & cell.size;
+        if (cellRect.contains(position)) {
+          final TableVicinity vicinity = cellParentData.tableVicinity;
+          final bool clipped =
+              clipBehavior != Clip.none &&
+              ((!_columnMetrics[vicinity.column]!.isPinned &&
+                      (position.dx < unpinnedCellsRect.left ||
+                          position.dx >= unpinnedCellsRect.right)) ||
+                  (!_rowMetrics[vicinity.row]!.isPinned &&
+                      (position.dy < unpinnedCellsRect.top ||
+                          position.dy >= unpinnedCellsRect.bottom)));
+          if (!clipped) {
+            final int priority = _hitTestPriority(vicinity);
+            if (priority > hitPriority) {
+              hitCell = cell;
+              hitPriority = priority;
+              // Unpinned tables have no overlapping regions. Priority 8 is the
+              // last painted pinned intersection, so no later match can win.
+              if (!hasPinnedCells || priority == 8) {
+                break;
+              }
+            }
+          }
         }
-        return true;
       }
       cell = childAfter(cell);
     }
-    return false;
+    if (hitCell == null) {
+      return false;
+    }
+    final TableViewParentData cellParentData = parentDataOf(hitCell);
+    result.addWithPaintOffset(
+      offset: cellParentData.paintOffset,
+      position: position,
+      hitTest: (BoxHitTestResult result, Offset transformed) {
+        assert(transformed == position - cellParentData.paintOffset!);
+        return hitCell!.hitTest(result, position: transformed);
+      },
+    );
+    switch (mainAxis) {
+      case Axis.vertical:
+        // Row major order, rows go first.
+        result.add(HitTestEntry(_rowMetrics[cellParentData.tableVicinity.row]!));
+        result.add(HitTestEntry(_columnMetrics[cellParentData.tableVicinity.column]!));
+      case Axis.horizontal:
+        // Column major order, columns go first.
+        result.add(HitTestEntry(_columnMetrics[cellParentData.tableVicinity.column]!));
+        result.add(HitTestEntry(_rowMetrics[cellParentData.tableVicinity.row]!));
+    }
+    return true;
   }
 
   // Updates the cached column metrics for the table.
@@ -1584,14 +1649,7 @@ class RenderTableViewport extends RenderTwoDimensionalViewport {
       _clipCellsHandle.layer = context.pushClipRect(
         needsCompositing,
         offset,
-        Rect.fromLTWH(
-          (reversedH ? _trailingPinnedColumnsExtent : _leadingPinnedColumnsExtent) +
-              (reversedH ? -_hAlignmentOffset : _hAlignmentOffset),
-          (reversedV ? _trailingPinnedRowsExtent : _leadingPinnedRowsExtent) +
-              (reversedV ? -_vAlignmentOffset : _vAlignmentOffset),
-          viewportDimension.width - _pinnedColumnsExtent,
-          viewportDimension.height - _pinnedRowsExtent,
-        ),
+        _unpinnedCellsRect,
         (PaintingContext context, Offset offset) {
           _paintCells(
             context: context,

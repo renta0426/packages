@@ -3954,6 +3954,292 @@ void main() {
     },
   );
 
+  // Regression test for https://github.com/flutter/flutter/issues/186876.
+  testWidgets('Trailing pinned cell popup wins over the underlying row gesture', (
+    WidgetTester tester,
+  ) async {
+    final horizontalController = ScrollController();
+    addTearDown(horizontalController.dispose);
+    var rowTaps = 0;
+    var popupOpened = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 400,
+            height: 400,
+            child: TableView.builder(
+              cacheExtent: 0,
+              columnCount: 20,
+              rowCount: 20,
+              trailingPinnedColumnCount: 1,
+              horizontalDetails: ScrollableDetails.horizontal(controller: horizontalController),
+              columnBuilder: (int column) =>
+                  TableSpan(extent: FixedTableSpanExtent(column == 19 ? 64 : 200)),
+              rowBuilder: (int row) => getTappableSpan(row, () => rowTaps++),
+              cellBuilder: (BuildContext context, TableVicinity vicinity) => TableViewCell(
+                child: vicinity.column == 19
+                    ? PopupMenuButton<int>(
+                        key: ValueKey<int>(vicinity.row),
+                        itemBuilder: (_) => const <PopupMenuEntry<int>>[
+                          PopupMenuItem<int>(value: 0, child: Text('Action')),
+                        ],
+                        onOpened: () => popupOpened++,
+                      )
+                    : Text('R${vicinity.row} C${vicinity.column}'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    for (final scrollOffset in <double>[0, 50, horizontalController.position.maxScrollExtent]) {
+      horizontalController.jumpTo(scrollOffset);
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey<int>(1)));
+      await tester.pumpAndSettle();
+      expect(find.text('Action'), findsOneWidget);
+      expect(rowTaps, 0);
+      await tester.tap(find.text('Action'));
+      await tester.pumpAndSettle();
+    }
+    expect(popupOpened, 3);
+  });
+
+  for (final TextDirection textDirection in TextDirection.values) {
+    for (final reverseHorizontal in <bool>[false, true]) {
+      for (final reverseVertical in <bool>[false, true]) {
+        for (final Axis mainAxis in Axis.values) {
+          for (final cacheExtent in <double>[0, 250]) {
+            for (final (cellGestures, clipBehavior) in <(bool, Clip)>[
+              (false, Clip.hardEdge),
+              (true, Clip.hardEdge),
+              (false, Clip.none),
+              (true, Clip.none),
+            ]) {
+              testWidgets(
+                'Pinned hit testing: $textDirection, horizontal reverse $reverseHorizontal, '
+                'vertical reverse $reverseVertical, $mainAxis, cache $cacheExtent, '
+                'cell gestures $cellGestures, $clipBehavior',
+                (WidgetTester tester) async {
+                  final horizontalController = ScrollController();
+                  final verticalController = ScrollController();
+                  addTearDown(horizontalController.dispose);
+                  addTearDown(verticalController.dispose);
+                  final taps = <String>[];
+                  await tester.pumpWidget(
+                    MaterialApp(
+                      home: Directionality(
+                        textDirection: textDirection,
+                        child: Align(
+                          alignment: Alignment.topLeft,
+                          child: SizedBox.square(
+                            dimension: 450,
+                            child: TableView.builder(
+                              clipBehavior: clipBehavior,
+                              mainAxis: mainAxis,
+                              cacheExtent: cacheExtent,
+                              columnCount: 20,
+                              rowCount: 20,
+                              pinnedColumnCount: 1,
+                              pinnedRowCount: 1,
+                              trailingPinnedColumnCount: 1,
+                              trailingPinnedRowCount: 1,
+                              horizontalDetails: ScrollableDetails.horizontal(
+                                controller: horizontalController,
+                                reverse: reverseHorizontal,
+                              ),
+                              verticalDetails: ScrollableDetails.vertical(
+                                controller: verticalController,
+                                reverse: reverseVertical,
+                              ),
+                              columnBuilder: (int column) =>
+                                  getTappableSpan(column, () => taps.add('column $column')),
+                              rowBuilder: (int row) =>
+                                  getTappableSpan(row, () => taps.add('row $row')),
+                              cellBuilder: (BuildContext context, TableVicinity vicinity) =>
+                                  TableViewCell(
+                                    child: cellGestures
+                                        ? GestureDetector(
+                                            behavior: HitTestBehavior.opaque,
+                                            onTap: () =>
+                                                taps.add('cell ${vicinity.column} ${vicinity.row}'),
+                                            child: const SizedBox.expand(),
+                                          )
+                                        : const SizedBox.expand(),
+                                  ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+
+                  for (final scrollOffset in <double>[
+                    0,
+                    50,
+                    600,
+                    horizontalController.position.maxScrollExtent,
+                  ]) {
+                    horizontalController.jumpTo(scrollOffset);
+                    verticalController.jumpTo(scrollOffset);
+                    await tester.pump();
+                    expect(tester.takeException(), isNull);
+                    // Cover all nine intersections of leading pinned, scrolling,
+                    // and trailing pinned spans, including partially hidden cells.
+                    for (final x in <double>[50, 225, 400]) {
+                      for (final y in <double>[50, 225, 400]) {
+                        final int column = x == 50
+                            ? 0
+                            : x == 400
+                            ? 19
+                            : (x + scrollOffset) ~/ 100;
+                        final int row = y == 50
+                            ? 0
+                            : y == 400
+                            ? 19
+                            : (y + scrollOffset) ~/ 100;
+                        taps.clear();
+                        await tester.tapAt(
+                          Offset(reverseHorizontal ? 450 - x : x, reverseVertical ? 450 - y : y),
+                        );
+                        expect(taps, <String>[
+                          if (cellGestures)
+                            'cell $column $row'
+                          else if (mainAxis == Axis.vertical)
+                            'row $row'
+                          else
+                            'column $column',
+                        ], reason: 'scroll $scrollOffset, logical position ($x, $y)');
+                      }
+                    }
+                  }
+                },
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (final clipping in <Clip>[Clip.hardEdge, Clip.none]) {
+    testWidgets('Hit testing through pinned span padding: $clipping', (WidgetTester tester) async {
+      final taps = <TableVicinity>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Align(
+            alignment: Alignment.topLeft,
+            child: SizedBox.square(
+              dimension: 450,
+              child: TableView.builder(
+                clipBehavior: clipping,
+                columnCount: 20,
+                rowCount: 20,
+                trailingPinnedColumnCount: 1,
+                trailingPinnedRowCount: 1,
+                columnBuilder: (int index) => index == 19
+                    ? const TableSpan(
+                        extent: FixedTableSpanExtent(80),
+                        padding: TableSpanPadding(leading: 10, trailing: 10),
+                      )
+                    : span,
+                rowBuilder: (int index) => index == 19
+                    ? const TableSpan(
+                        extent: FixedTableSpanExtent(80),
+                        padding: TableSpanPadding(leading: 10, trailing: 10),
+                      )
+                    : span,
+                cellBuilder: (BuildContext context, TableVicinity vicinity) => TableViewCell(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => taps.add(vicinity),
+                    child: const SizedBox.expand(),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tapAt(const Offset(355, 150));
+      await tester.tapAt(const Offset(150, 355));
+      await tester.tapAt(const Offset(355, 355));
+      expect(
+        taps,
+        clipping == Clip.none
+            ? const <TableVicinity>[
+                TableVicinity(column: 3, row: 1),
+                TableVicinity(column: 1, row: 3),
+                TableVicinity(column: 3, row: 3),
+              ]
+            : isEmpty,
+      );
+      taps.clear();
+      await tester.tapAt(const Offset(360, 150));
+      await tester.tapAt(const Offset(150, 360));
+      await tester.tapAt(const Offset(360, 360));
+      expect(taps, const <TableVicinity>[
+        TableVicinity(column: 19, row: 1),
+        TableVicinity(column: 1, row: 19),
+        TableVicinity(column: 19, row: 19),
+      ]);
+    });
+  }
+
+  for (final TextDirection textDirection in TextDirection.values) {
+    for (final reverse in <bool>[false, true]) {
+      for (final alignment in <AlignmentGeometry>[
+        Alignment.center,
+        AlignmentDirectional.bottomEnd,
+      ]) {
+        testWidgets('Small table hit testing: $textDirection, reverse $reverse, $alignment', (
+          WidgetTester tester,
+        ) async {
+          final taps = <TableVicinity>[];
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Directionality(
+                textDirection: textDirection,
+                child: TableView.builder(
+                  alignment: alignment,
+                  columnCount: 3,
+                  rowCount: 3,
+                  pinnedColumnCount: 1,
+                  pinnedRowCount: 1,
+                  trailingPinnedColumnCount: 1,
+                  trailingPinnedRowCount: 1,
+                  horizontalDetails: ScrollableDetails.horizontal(reverse: reverse),
+                  verticalDetails: ScrollableDetails.vertical(reverse: reverse),
+                  columnBuilder: (_) => span,
+                  rowBuilder: (_) => span,
+                  cellBuilder: (BuildContext context, TableVicinity vicinity) => TableViewCell(
+                    child: GestureDetector(
+                      key: ValueKey<TableVicinity>(vicinity),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => taps.add(vicinity),
+                      child: const SizedBox.expand(),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          for (var column = 0; column < 3; column++) {
+            for (var row = 0; row < 3; row++) {
+              final vicinity = TableVicinity(column: column, row: row);
+              taps.clear();
+              await tester.tap(find.byKey(ValueKey<TableVicinity>(vicinity)));
+              expect(taps, <TableVicinity>[vicinity]);
+            }
+          }
+        });
+      }
+    }
+  }
+
   testWidgets('Trailing pinned columns and rows - smoke test', (WidgetTester tester) async {
     final horizontalController = ScrollController();
     final verticalController = ScrollController();
